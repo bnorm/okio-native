@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
+import static okio.NativeUtil.*;
 import static okio.Util.checkOffsetAndCount;
 import static okio.Util.reverseBytesLong;
 
@@ -347,7 +348,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
     int pos = segment.pos;
     int limit = segment.limit;
 
-    byte b = NativeSegment.UNSAFE.getByte(segment.address + pos);
+    byte b = UNSAFE.getByte(segment.address + pos);
     pos += 1;
     size -= 1;
 
@@ -368,7 +369,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
     checkOffsetAndCount(size, pos, 1);
     for (NativeSegment s = head; true; s = s.next) {
       int segmentByteCount = s.limit - s.pos;
-      if (pos < segmentByteCount) return NativeSegment.UNSAFE.getByte(s.address + s.pos + pos);
+      if (pos < segmentByteCount) return UNSAFE.getByte(s.address + s.pos + pos);
       pos -= segmentByteCount;
     }
   }
@@ -387,7 +388,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
       return (short) s;
     }
 
-    int s = NativeSegment.UNSAFE.getShort(segment.address + pos);
+    int s = UNSAFE.getShort(segment.address + pos);
     pos += 2;
     size -= 2;
 
@@ -416,7 +417,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
               | (readByte() & 0xff);
     }
 
-    int i = NativeSegment.UNSAFE.getInt(segment.address + pos);
+    int i = UNSAFE.getInt(segment.address + pos);
     pos -= 4;
     size -= 4;
 
@@ -443,7 +444,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
               | (readInt() & 0xffffffffL);
     }
 
-    long v = NativeSegment.UNSAFE.getLong(segment.address + pos);
+    long v = UNSAFE.getLong(segment.address + pos);
     pos += 8;
     size -= 8;
 
@@ -489,7 +490,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
       int limit = segment.limit;
 
       for (; pos < limit; pos++, seen++) {
-        byte b = NativeSegment.UNSAFE.getByte(address + pos);
+        byte b = UNSAFE.getByte(address + pos);
         if (b >= '0' && b <= '9') {
           int digit = '0' - b;
 
@@ -544,7 +545,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
       for (; pos < limit; pos++, seen++) {
         int digit;
 
-        byte b = NativeSegment.UNSAFE.getByte(address + pos);
+        byte b = UNSAFE.getByte(address + pos);
         if (b >= '0' && b <= '9') {
           digit = b - '0';
         } else if (b >= 'a' && b <= 'f') {
@@ -584,14 +585,35 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
   }
 
   @Override public NativeByteString readByteString() {
-    return new NativeByteString(readByteArray());
+    return readByteString(size);
   }
 
-  @Override public NativeByteString readByteString(long byteCount) throws EOFException {
-    return new NativeByteString(readByteArray(byteCount));
+  @Override public NativeByteString readByteString(long byteCount) {
+    checkOffsetAndCount(size, 0, byteCount);
+    long address = UNSAFE.allocateMemory(byteCount);
+
+    NativeSegment s = head;
+    int offset = 0;
+    while (byteCount > 0) {
+      long toCopy = Math.min(byteCount, s.limit - s.pos);
+      UNSAFE.copyMemory(s.address, address + offset, toCopy);
+
+      s.pos += toCopy;
+      size -= toCopy;
+      offset += toCopy;
+      byteCount -= toCopy;
+
+      if (s.pos == s.limit) {
+        NativeSegment toRecycle = s;
+        head = s = toRecycle.pop();
+        NativeSegmentPool.recycle(toRecycle);
+      }
+    }
+
+    return new NativeByteString(address, byteCount);
   }
 
-  @Override public int select(Options options) {
+  @Override public int select(NativeOptions options) {
     NativeSegment s = head;
     if (s == null) return options.indexOf(NativeByteString.EMPTY);
 
@@ -615,7 +637,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
    * that this buffer is a prefix of. Unlike {@link #select} this never consumes the value, even
    * if it is found in full.
    */
-  int selectPrefix(Options options) {
+  int selectPrefix(NativeOptions options) {
     NativeSegment s = head;
     NativeByteString[] byteStrings = options.byteStrings;
     for (int i = 0, listSize = byteStrings.length; i < listSize; i++) {
@@ -887,7 +909,23 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
 
   @Override public NativeBuffer write(NativeByteString byteString) {
     if (byteString == null) throw new IllegalArgumentException("byteString == null");
-    write(byteString.internalAddress());
+    checkOffsetAndCount(size, 0, byteString.size());
+
+    long address = byteString.internalAddress();
+    long byteCount = byteString.size();
+
+    long offset = 0;
+    while (offset < byteCount) {
+      NativeSegment tail = writableNativeSegment(1);
+
+      long toCopy = Math.min(byteCount - offset, NativeSegment.SIZE - tail.limit);
+      UNSAFE.copyMemory(address + offset, tail.address + tail.pos, toCopy);
+
+      offset += toCopy;
+      tail.limit += toCopy;
+    }
+
+    size += byteCount;
     return this;
   }
 
@@ -917,7 +955,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
         int runLimit = Math.min(endIndex, NativeSegment.SIZE - segmentOffset);
 
         // Emit a 7-bit character with 1 byte.
-        NativeSegment.UNSAFE.putByte(address + segmentOffset + i, (byte) c); // 0xxxxxxx
+        UNSAFE.putByte(address + segmentOffset + i, (byte) c); // 0xxxxxxx
         i += 1;
 
         // Fast-path contiguous runs of ASCII characters. This is ugly, but yields a ~4x performance
@@ -925,7 +963,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
         while (i < runLimit) {
           c = string.charAt(i);
           if (c >= 0x80) break;
-          NativeSegment.UNSAFE.putByte(address + segmentOffset + i, (byte) c); // 0xxxxxxx
+          UNSAFE.putByte(address + segmentOffset + i, (byte) c); // 0xxxxxxx
           i += 1;
         }
 
@@ -1074,7 +1112,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
 
   @Override public NativeBuffer writeByte(int b) {
     NativeSegment tail = writableNativeSegment(1);
-    NativeSegment.UNSAFE.putByte(tail.address + tail.limit, (byte) b);
+    UNSAFE.putByte(tail.address + tail.limit, (byte) b);
     tail.limit += 1;
     size += 1;
     return this;
@@ -1082,7 +1120,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
 
   @Override public NativeBuffer writeShort(int s) {
     NativeSegment tail = writableNativeSegment(2);
-    NativeSegment.UNSAFE.putShort(tail.address + tail.limit, (short) s);
+    UNSAFE.putShort(tail.address + tail.limit, (short) s);
     tail.limit += 2;
     size += 2;
     return this;
@@ -1094,7 +1132,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
 
   @Override public NativeBuffer writeInt(int i) {
     NativeSegment tail = writableNativeSegment(4);
-    NativeSegment.UNSAFE.putInt(tail.address + tail.limit, i);
+    UNSAFE.putInt(tail.address + tail.limit, i);
     tail.limit += 4;
     size += 4;
     return this;
@@ -1106,7 +1144,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
 
   @Override public NativeBuffer writeLong(long v) {
     NativeSegment tail = writableNativeSegment(8);
-    NativeSegment.UNSAFE.putLong(tail.address + tail.limit, v);
+    UNSAFE.putLong(tail.address + tail.limit, v);
     tail.limit += 8;
     size += 8;
     return this;
@@ -1160,12 +1198,12 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
     int pos = tail.limit + width; // We write backwards from right to left.
     while (v != 0) {
       int digit = (int) (v % 10);
-      NativeSegment.UNSAFE.putByte(address + pos, DIGITS[digit]);
+      UNSAFE.putByte(address + pos, DIGITS[digit]);
       pos -= 1;
       v /= 10;
     }
     if (negative) {
-      NativeSegment.UNSAFE.putByte(address + pos, (byte) '-');
+      UNSAFE.putByte(address + pos, (byte) '-');
       pos -= 1;
     }
 
@@ -1185,7 +1223,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
     NativeSegment tail = writableNativeSegment(width);
     long address = tail.address;
     for (int pos = tail.limit + width - 1, start = tail.limit; pos >= start; pos--) {
-      NativeSegment.UNSAFE.putByte(address + pos, DIGITS[(int) (v & 0xF)]);
+      UNSAFE.putByte(address + pos, DIGITS[(int) (v & 0xF)]);
       v >>>= 4;
     }
     tail.limit += width;
@@ -1361,7 +1399,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
       }
     }
 
-    // todo - native
+    // todo(bnorm) - native
 //    // Scan through the segments, searching for b.
 //    while (offset < toIndex) {
 //      byte[] data = s.data;
@@ -1478,7 +1516,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
       }
     }
 
-    // todo - native
+    // todo(bnorm) - native
 //    // Special case searching for one of two bytes. This is a common case for tools like Moshi,
 //    // which search for pairs of chars like `\r` and `\n` or {@code `"` and `\`. The impact of this
 //    // optimization is a ~5x speedup for this case without a substantial cost to other cases.
@@ -1535,42 +1573,59 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
             || bytes.size() - bytesOffset < byteCount) {
       return false;
     }
-    for (int i = 0; i < byteCount; i++) {
-      if (getByte(offset + i) != bytes.getByte(bytesOffset + i)) {
+
+    NativeSegment s;
+    long fromIndex;
+
+    // TODO(jwilson): extract this to a shared helper method when can do so without allocating.
+    findNativeSegmentAndOffset:
+    {
+      // Pick the first segment to scan. This is the first segment with fromIndex <= offset.
+      s = head;
+      if (s == null) {
+        // No segments to scan!
         return false;
+      } else if (size - offset < offset) {
+        // We're scanning in the back half of this buffer. Find the segment starting at the back.
+        fromIndex = size;
+        while (fromIndex > offset) {
+          s = s.prev;
+          fromIndex -= (s.limit - s.pos);
+        }
+      } else {
+        // We're scanning in the front half of this buffer. Find the segment starting at the front.
+        fromIndex = 0L;
+        for (long nextOffset; (nextOffset = fromIndex + (s.limit - s.pos)) < offset; ) {
+          s = s.next;
+          fromIndex = nextOffset;
+        }
       }
     }
-    return true;
+
+    int pos = (int) (s.pos + offset - fromIndex);
+    return rangeEquals(s, pos, bytes, bytesOffset, byteCount);
   }
 
   /**
    * Returns true if the range within this buffer starting at {@code segmentPos} in {@code segment}
    * is equal to {@code bytes[bytesOffset..bytesLimit)}.
    */
-  // todo - native
   private boolean rangeEquals(
           NativeSegment segment, int segmentPos, NativeByteString bytes, int bytesOffset, int bytesLimit) {
-    throw new UnsupportedOperationException("native");
-//    int segmentLimit = segment.limit;
-//    byte[] data = segment.data;
-//
-//    for (int i = bytesOffset; i < bytesLimit; ) {
-//      if (segmentPos == segmentLimit) {
-//        segment = segment.next;
-//        data = segment.data;
-//        segmentPos = segment.pos;
-//        segmentLimit = segment.limit;
-//      }
-//
-//      if (data[segmentPos] != bytes.getByte(i)) {
-//        return false;
-//      }
-//
-//      segmentPos++;
-//      i++;
-//    }
-//
-//    return true;
+    long address = bytes.internalAddress();
+
+    for (int i = bytesOffset; i < bytesLimit; ) {
+      long toCheck = Math.min(segment.limit - segmentPos, bytesLimit - i);
+      if (!equals0(segment.address + segmentPos, address + i, toCheck)) {
+        return false;
+      }
+
+      i += toCheck;
+      segment = segment.next;
+      segmentPos = segment.pos;
+    }
+
+    return true;
   }
 
   @Override public void flush() {
@@ -1600,63 +1655,56 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
    * Returns the 128-bit MD5 hash of this buffer.
    */
   public NativeByteString md5() {
-    Buffer buffer = new Buffer();
-    copyTo(buffer);
-    return buffer.md5();
+    // todo(bnorm) - native
+    throw new UnsupportedOperationException();
   }
 
   /**
    * Returns the 160-bit SHA-1 hash of this buffer.
    */
   public NativeByteString sha1() {
-    Buffer buffer = new Buffer();
-    copyTo(buffer);
-    return buffer.sha1();
+    // todo(bnorm) - native
+    throw new UnsupportedOperationException();
   }
 
   /**
    * Returns the 256-bit SHA-256 hash of this buffer.
    */
   public NativeByteString sha256() {
-    Buffer buffer = new Buffer();
-    copyTo(buffer);
-    return buffer.sha256();
+    // todo(bnorm) - native
+    throw new UnsupportedOperationException();
   }
 
   /**
    * Returns the 512-bit SHA-512 hash of this buffer.
    */
   public NativeByteString sha512() {
-    Buffer buffer = new Buffer();
-    copyTo(buffer);
-    return buffer.sha512();
+    // todo(bnorm) - native
+    throw new UnsupportedOperationException();
   }
 
   /**
    * Returns the 160-bit SHA-1 HMAC of this buffer.
    */
   public NativeByteString hmacSha1(NativeByteString key) {
-    Buffer buffer = new Buffer();
-    copyTo(buffer);
-    return buffer.hmacSha1(key);
+    // todo(bnorm) - native
+    throw new UnsupportedOperationException();
   }
 
   /**
    * Returns the 256-bit SHA-256 HMAC of this buffer.
    */
   public NativeByteString hmacSha256(NativeByteString key) {
-    Buffer buffer = new Buffer();
-    copyTo(buffer);
-    return buffer.hmacSha256(key);
+    // todo(bnorm) - native
+    throw new UnsupportedOperationException();
   }
 
   /**
    * Returns the 512-bit SHA-512 HMAC of this buffer.
    */
   public NativeByteString hmacSha512(NativeByteString key) {
-    Buffer buffer = new Buffer();
-    copyTo(buffer);
-    return buffer.hmacSha512(key);
+    // todo(bnorm) - native
+    throw new UnsupportedOperationException();
   }
 
   @Override public boolean equals(Object o) {
@@ -1674,10 +1722,9 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
     for (long pos = 0, count; pos < size; pos += count) {
       count = Math.min(sa.limit - posA, sb.limit - posB);
 
-      // todo - native
-//      for (int i = 0; i < count; i++) {
-//        if (sa.data[posA++] != sb.data[posB++]) return false;
-//      }
+      if (!equals0(sa.address + sa.pos, sb.address + sb.pos, count)) {
+        return false;
+      }
 
       if (posA == sa.limit) {
         sa = sa.next;
@@ -1698,10 +1745,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
     if (s == null) return 0;
     int result = 1;
     do {
-      // todo - native
-//      for (int pos = s.pos, limit = s.limit; pos < limit; pos++) {
-//        result = 31 * result + s.data[pos];
-//      }
+      result = 31 * result + hash0(s.address + s.pos, s.limit - s.pos);
       s = s.next;
     } while (s != head);
     return result;
@@ -1746,7 +1790,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
    */
   public NativeByteString snapshot(int byteCount) {
     throw new UnsupportedOperationException();
-//    if (byteCount == 0) return ByteString.EMPTY;
+//    if (byteCount == 0) return NativeByteString.EMPTY;
 //    return new NativeSegmentedByteString(this, byteCount);
   }
 }

@@ -7,10 +7,8 @@ import java.io.*;
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
-import java.util.Arrays;
 
-import static okio.NativeUtil.UNSAFE;
-import static okio.NativeUtil.copyFromArray;
+import static okio.NativeUtil.*;
 import static okio.Util.arrayRangeEquals;
 import static okio.Util.checkOffsetAndCount;
 
@@ -30,7 +28,6 @@ import static okio.Util.checkOffsetAndCount;
 public class NativeByteString implements Serializable, Comparable<NativeByteString> {
   static final char[] HEX_DIGITS =
           {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
-  private static final long serialVersionUID = 1L;
 
   /**
    * A singleton empty {@code ByteString}.
@@ -38,11 +35,14 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
   public static final NativeByteString EMPTY = NativeByteString.of();
 
   final long address;
+  final int size;
   transient int hashCode; // Lazily computed; 0 if unknown.
   transient String utf8; // Lazily computed.
 
-  NativeByteString(long address) {
+  NativeByteString(long address, int size) {
+    // todo(bnorm) - need to free the address when finalized
     this.address = address; // Trusted internal constructor doesn't clone data.
+    this.size = size;
   }
 
   /**
@@ -53,7 +53,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
 
     long address = UNSAFE.allocateMemory(data.length);
     copyFromArray(data, 0, address, data.length);
-    return new NativeByteString(address);
+    return new NativeByteString(address, data.length);
   }
 
   /**
@@ -66,7 +66,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
 
     long address = UNSAFE.allocateMemory(data.length);
     copyFromArray(data, offset, address, byteCount);
-    return new NativeByteString(address);
+    return new NativeByteString(address, data.length);
   }
 
   public static NativeByteString of(ByteBuffer data) {
@@ -79,14 +79,14 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
     } else if (data.hasArray()) {
       copyFromArray(data.array(), data.position(), address, byteCount);
     } else {
-      // TODO: is there a way to void this Heap -> Heap -> Off-Heap copy?
-      // Would a Heap -> Off-Heap -> Off-Heap double copy be better?
+      // todo(bnorm) is there a way to void this Heap -> Heap -> Off-Heap copy?
+      // Would a Heap -> Off-Heap -> Off-Heap copy be better? (ie, DirectByteBuffer)
       byte[] copy = new byte[byteCount];
       data.get(copy);
       copyFromArray(copy, 0, address, byteCount);
     }
 
-    return new NativeByteString(address);
+    return new NativeByteString(address, byteCount);
   }
 
   /**
@@ -94,7 +94,8 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
    */
   public static NativeByteString encodeUtf8(String s) {
     if (s == null) throw new IllegalArgumentException("s == null");
-    NativeByteString byteString = new NativeByteString(s.getBytes(Util.UTF_8));
+    // todo(bnorm) is there a way to void this Heap -> Heap -> Off-Heap copy?
+    NativeByteString byteString = of(s.getBytes(Util.UTF_8));
     byteString.utf8 = s;
     return byteString;
   }
@@ -105,7 +106,8 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
   public static NativeByteString encodeString(String s, Charset charset) {
     if (s == null) throw new IllegalArgumentException("s == null");
     if (charset == null) throw new IllegalArgumentException("charset == null");
-    return new NativeByteString(s.getBytes(charset));
+    // todo(bnorm) is there a way to void this Heap -> Heap -> Off-Heap copy?
+    return of(s.getBytes(charset));
   }
 
   /**
@@ -213,7 +215,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
    * Returns this byte string encoded in hexadecimal.
    */
   public String hex() {
-    char[] result = new char[data.length * 2];
+    char[] result = new char[size * 2];
     int c = 0;
     for (byte b : data) {
       result[c++] = HEX_DIGITS[(b >> 4) & 0xf];
@@ -260,7 +262,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
       read = in.read(result, offset, byteCount - offset);
       if (read == -1) throw new EOFException();
     }
-    return new NativeByteString(result);
+    return new NativeByteString(result, byteCount);
   }
 
   /**
@@ -270,7 +272,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
    */
   public NativeByteString toAsciiLowercase() {
     // Search for an uppercase character. If we don't find one, return this.
-    for (int i = 0; i < data.length; i++) {
+    for (int i = 0; i < size; i++) {
       byte c = data[i];
       if (c < 'A' || c > 'Z') continue;
 
@@ -283,7 +285,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
         if (c < 'A' || c > 'Z') continue;
         lowercase[i] = (byte) (c - ('A' - 'a'));
       }
-      return new NativeByteString(lowercase);
+      return new NativeByteString(lowercase, size);
     }
     return this;
   }
@@ -295,7 +297,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
    */
   public NativeByteString toAsciiUppercase() {
     // Search for an lowercase character. If we don't find one, return this.
-    for (int i = 0; i < data.length; i++) {
+    for (int i = 0; i < size; i++) {
       byte c = data[i];
       if (c < 'a' || c > 'z') continue;
 
@@ -308,7 +310,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
         if (c < 'a' || c > 'z') continue;
         lowercase[i] = (byte) (c - ('a' - 'A'));
       }
-      return new NativeByteString(lowercase);
+      return new NativeByteString(lowercase, size);
     }
     return this;
   }
@@ -318,7 +320,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
    * index until the end of this string. Returns this byte string if {@code beginIndex} is 0.
    */
   public NativeByteString substring(int beginIndex) {
-    return substring(beginIndex, data.length);
+    return substring(beginIndex, size);
   }
 
   /**
@@ -328,14 +330,14 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
    */
   public NativeByteString substring(int beginIndex, int endIndex) {
     if (beginIndex < 0) throw new IllegalArgumentException("beginIndex < 0");
-    if (endIndex > data.length) {
-      throw new IllegalArgumentException("endIndex > length(" + data.length + ")");
+    if (endIndex > size) {
+      throw new IllegalArgumentException("endIndex > length(" + size + ")");
     }
 
     int subLen = endIndex - beginIndex;
     if (subLen < 0) throw new IllegalArgumentException("endIndex < beginIndex");
 
-    if ((beginIndex == 0) && (endIndex == data.length)) {
+    if ((beginIndex == 0) && (endIndex == size)) {
       return this;
     }
 
@@ -355,7 +357,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
    * Returns the number of bytes in this ByteString.
    */
   public int size() {
-    return data.length;
+    return size;
   }
 
   /**
@@ -388,7 +390,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
    * Writes the contents of this byte string to {@code buffer}.
    */
   void write(Buffer buffer) {
-    buffer.write(data, 0, data.length);
+    buffer.write(data, 0, size);
   }
 
   /**
@@ -406,7 +408,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
    * out of bounds.
    */
   public boolean rangeEquals(int offset, byte[] other, int otherOffset, int byteCount) {
-    return offset >= 0 && offset <= data.length - byteCount
+    return offset >= 0 && offset <= size - byteCount
             && otherOffset >= 0 && otherOffset <= other.length - byteCount
             && arrayRangeEquals(data, offset, other, otherOffset, byteCount);
   }
@@ -428,7 +430,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
   }
 
   public final int indexOf(NativeByteString other) {
-    return indexOf(other.internalArray(), 0);
+    return indexOf(other, 0);
   }
 
   public final int indexOf(NativeByteString other, int fromIndex) {
@@ -441,7 +443,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
 
   public int indexOf(byte[] other, int fromIndex) {
     fromIndex = Math.max(fromIndex, 0);
-    for (int i = fromIndex, limit = data.length - other.length; i <= limit; i++) {
+    for (int i = fromIndex, limit = size - other.length; i <= limit; i++) {
       if (arrayRangeEquals(data, i, other, 0, other.length)) {
         return i;
       }
@@ -450,7 +452,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
   }
 
   public final int lastIndexOf(NativeByteString other) {
-    return lastIndexOf(other.internalArray(), size());
+    return lastIndexOf(other, size());
   }
 
   public final int lastIndexOf(NativeByteString other, int fromIndex) {
@@ -462,7 +464,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
   }
 
   public int lastIndexOf(byte[] other, int fromIndex) {
-    fromIndex = Math.min(fromIndex, data.length - other.length);
+    fromIndex = Math.min(fromIndex, size - other.length);
     for (int i = fromIndex; i >= 0; i--) {
       if (arrayRangeEquals(data, i, other, 0, other.length)) {
         return i;
@@ -474,13 +476,13 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
   @Override public boolean equals(Object o) {
     if (o == this) return true;
     return o instanceof NativeByteString
-            && ((NativeByteString) o).size() == data.length
-            && ((NativeByteString) o).rangeEquals(0, data, 0, data.length);
+            && ((NativeByteString) o).size() == size
+            && rangeEquals(0, ((NativeByteString) o), 0, size);
   }
 
   @Override public int hashCode() {
     int result = hashCode;
-    return result != 0 ? result : (hashCode = Arrays.hashCode(data));
+    return result != 0 ? result : (hashCode = hash0(address, size));
   }
 
   @Override public int compareTo(NativeByteString byteString) {
@@ -501,7 +503,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
    * is a string like {@code [text=Hello]} or {@code [hex=0000ffff]}.
    */
   @Override public String toString() {
-    if (data.length == 0) {
+    if (size == 0) {
       return "[size=0]";
     }
 
@@ -509,9 +511,9 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
     int i = codePointIndexToCharIndex(text, 64);
 
     if (i == -1) {
-      return data.length <= 64
+      return size <= 64
               ? "[hex=" + hex() + "]"
-              : "[size=" + data.length + " hex=" + substring(0, 64).hex() + "…]";
+              : "[size=" + size + " hex=" + substring(0, 64).hex() + "…]";
     }
 
     String safeText = text.substring(0, i)
@@ -519,7 +521,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
             .replace("\n", "\\n")
             .replace("\r", "\\r");
     return i < text.length()
-            ? "[size=" + data.length + " text=" + safeText + "…]"
+            ? "[size=" + size + " text=" + safeText + "…]"
             : "[text=" + safeText + "]";
   }
 
@@ -542,9 +544,13 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
     int dataLength = in.readInt();
     NativeByteString byteString = NativeByteString.read(in, dataLength);
     try {
-      Field field = NativeByteString.class.getDeclaredField("data");
-      field.setAccessible(true);
-      field.set(this, byteString.data);
+      Field size = NativeByteString.class.getDeclaredField("size");
+      size.setAccessible(true);
+      size.set(this, dataLength);
+      Field address = NativeByteString.class.getDeclaredField("address");
+      address.setAccessible(true);
+      address.set(this, byteString.address);
+      // todo(bnorm) - make sure byteString doesn't free memory
     } catch (NoSuchFieldException e) {
       throw new AssertionError();
     } catch (IllegalAccessException e) {
@@ -553,7 +559,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
   }
 
   private void writeObject(ObjectOutputStream out) throws IOException {
-    out.writeInt(data.length);
-    out.write(data);
+    out.writeInt(size);
+    write(out);
   }
 }

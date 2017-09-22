@@ -22,4 +22,8 @@ final class NativeUtil {
   static void copyFromArray(byte[] src, long srcPos, long dstAddr, long length) {
     UNSAFE.copyMemory(src, arrayBaseOffset + srcPos, null, dstAddr, length);
   }
+
+  static native boolean equals0(long address1, long address2, long limit);
+
+  static native int hash0(long address, long limit);
 }

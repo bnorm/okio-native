@@ -68,7 +68,9 @@ final class NativeSegment {
   }
 
   public void free() {
-    UNSAFE.freeMemory(address);
+    if (owner) {
+      UNSAFE.freeMemory(address);
+    }
   }
 
   /**

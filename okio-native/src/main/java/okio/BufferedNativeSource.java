@@ -226,7 +226,7 @@ public interface BufferedNativeSource extends NativeSource {
    */
   void skip(long byteCount) throws IOException;
 
-  /** Removes all bytes bytes from this and returns them as a byte string. */
+  /** Removes all bytes from this and returns them as a byte string. */
   NativeByteString readByteString() throws IOException;
 
   /** Removes {@code byteCount} bytes from this and returns them as a byte string. */
@@ -257,7 +257,7 @@ public interface BufferedNativeSource extends NativeSource {
    *   assertEquals('\n', buffer.readByte());
    * }</pre>
    */
-  int select(Options options) throws IOException;
+  int select(NativeOptions options) throws IOException;
 
   /** Removes all bytes from this and returns them as a byte array. */
   byte[] readByteArray() throws IOException;
