@@ -35,15 +35,9 @@ final class NativeSegmentPool {
 
   static void recycle(NativeSegment segment) {
     if (segment.next != null || segment.prev != null) throw new IllegalArgumentException();
-    if (segment.shared) {
-      // todo(bnorm) - memory leak if it's the owner
-      return; // This segment cannot be recycled.
-    }
+    if (segment.shared) return; // This segment cannot be recycled.
     synchronized (NativeSegmentPool.class) {
-      if (byteCount + NativeSegment.SIZE > MAX_SIZE) {
-        segment.free();
-        return; // Pool is full.
-      }
+      if (byteCount + NativeSegment.SIZE > MAX_SIZE) return; // Pool is full.
       byteCount += NativeSegment.SIZE;
       segment.next = next;
       segment.pos = segment.limit = 0;

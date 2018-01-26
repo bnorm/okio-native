@@ -1,6 +1,10 @@
 package okio;
 
-import javax.annotation.Nullable;
+import static okio.NativeUtil.equals0;
+import static okio.NativeUtil.hash0;
+import static okio.Util.checkOffsetAndCount;
+import static okio.Util.reverseBytesLong;
+
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
@@ -9,10 +13,7 @@ import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-
-import static okio.NativeUtil.*;
-import static okio.Util.checkOffsetAndCount;
-import static okio.Util.reverseBytesLong;
+import javax.annotation.Nullable;
 
 @SuppressWarnings("Duplicates")
 public final class NativeBuffer implements BufferedNativeSource, BufferedNativeSink, Cloneable {
@@ -121,19 +122,23 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
     if (byteCount == 0) return this;
 
     // Skip segments that we aren't copying from.
-    NativeSegment s = head;
-    for (; offset >= (s.limit - s.pos); s = s.next) {
-      offset -= (s.limit - s.pos);
+    NativeSegment source = head;
+    for (; offset >= (source.limit - source.pos); source = source.next) {
+      offset -= (source.limit - source.pos);
     }
 
     // Copy from one segment at a time.
-    for (; byteCount > 0; s = s.next) {
-      int pos = (int) (s.pos + offset);
-      int toCopy = (int) Math.min(s.limit - pos, byteCount);
+    for (; byteCount > 0; source = source.next) {
+      int pos = (int) (source.pos + offset);
+      // TODO(bnorm): use buffer cursor
+      Segment destination = out.writableSegment(1);
 
-      Segment segment = out.writableSegment(toCopy);
-      s.copyTo(offset, toCopy, segment.data, segment.pos + segment.limit);
-      segment.limit += toCopy;
+      // Maximum copy length of source, destination, and the remaining data
+      int toCopy = (int) Math.min(byteCount, destination.limit - destination.pos);
+      toCopy = Math.min(source.limit - pos, toCopy);
+
+      source.copyTo(offset, toCopy, destination.data, destination.limit);
+      destination.limit += toCopy;
       out.size += toCopy;
 
       byteCount -= toCopy;
@@ -185,7 +190,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
 
     // Copy one segment at a time.
     for (; byteCount > 0; s = s.next) {
-      NativeSegment copy = new NativeSegment(s);
+      NativeSegment copy = s.sharedCopy();
       copy.pos += offset;
       copy.limit = Math.min(copy.pos + (int) byteCount, copy.limit);
       if (out.head == null) {
@@ -282,7 +287,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
       int toCopy = (int) Math.min(byteCount, s.limit - s.pos);
 
       NativeSegment tail = writableNativeSegment(toCopy);
-      tail.copyFrom(0, toCopy, s.data, s.pos);
+      tail.copyFrom(s.data, s.pos, toCopy);
       tail.limit += toCopy;
       size += toCopy;
 
@@ -348,7 +353,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
     int pos = segment.pos;
     int limit = segment.limit;
 
-    byte b = UNSAFE.getByte(segment.address + pos);
+    byte b = NativeUtil.getByte(segment.address, pos);
     pos += 1;
     size -= 1;
 
@@ -369,7 +374,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
     checkOffsetAndCount(size, pos, 1);
     for (NativeSegment s = head; true; s = s.next) {
       int segmentByteCount = s.limit - s.pos;
-      if (pos < segmentByteCount) return UNSAFE.getByte(s.address + s.pos + pos);
+      if (pos < segmentByteCount) return NativeUtil.getByte(s.address, s.pos + pos);;
       pos -= segmentByteCount;
     }
   }
@@ -388,7 +393,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
       return (short) s;
     }
 
-    int s = UNSAFE.getShort(segment.address + pos);
+    int s = NativeUtil.getShort(segment.address, pos);
     pos += 2;
     size -= 2;
 
@@ -417,7 +422,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
               | (readByte() & 0xff);
     }
 
-    int i = UNSAFE.getInt(segment.address + pos);
+    int i = NativeUtil.getInt(segment.address, pos);
     pos -= 4;
     size -= 4;
 
@@ -444,7 +449,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
               | (readInt() & 0xffffffffL);
     }
 
-    long v = UNSAFE.getLong(segment.address + pos);
+    long v = NativeUtil.getLong(segment.address, pos);
     pos += 8;
     size -= 8;
 
@@ -490,7 +495,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
       int limit = segment.limit;
 
       for (; pos < limit; pos++, seen++) {
-        byte b = UNSAFE.getByte(address + pos);
+        byte b = NativeUtil.getByte(address, pos);
         if (b >= '0' && b <= '9') {
           int digit = '0' - b;
 
@@ -545,7 +550,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
       for (; pos < limit; pos++, seen++) {
         int digit;
 
-        byte b = UNSAFE.getByte(address + pos);
+        byte b = NativeUtil.getByte(address, pos);
         if (b >= '0' && b <= '9') {
           digit = b - '0';
         } else if (b >= 'a' && b <= 'f') {
@@ -590,13 +595,17 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
 
   @Override public NativeByteString readByteString(long byteCount) {
     checkOffsetAndCount(size, 0, byteCount);
-    long address = UNSAFE.allocateMemory(byteCount);
+    if (byteCount > Integer.MAX_VALUE) {
+      throw new IllegalArgumentException("byteCount > Integer.MAX_VALUE: " + byteCount);
+    }
+
+    long address = NativeUtil.allocate(byteCount);
 
     NativeSegment s = head;
     int offset = 0;
     while (byteCount > 0) {
       long toCopy = Math.min(byteCount, s.limit - s.pos);
-      UNSAFE.copyMemory(s.address, address + offset, toCopy);
+      NativeUtil.copy(s.address, address + offset, toCopy);
 
       s.pos += toCopy;
       size -= toCopy;
@@ -610,7 +619,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
       }
     }
 
-    return new NativeByteString(address, byteCount);
+    return new NativeByteString(address, (int) byteCount);
   }
 
   @Override public int select(NativeOptions options) {
@@ -909,23 +918,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
 
   @Override public NativeBuffer write(NativeByteString byteString) {
     if (byteString == null) throw new IllegalArgumentException("byteString == null");
-    checkOffsetAndCount(size, 0, byteString.size());
-
-    long address = byteString.internalAddress();
-    long byteCount = byteString.size();
-
-    long offset = 0;
-    while (offset < byteCount) {
-      NativeSegment tail = writableNativeSegment(1);
-
-      long toCopy = Math.min(byteCount - offset, NativeSegment.SIZE - tail.limit);
-      UNSAFE.copyMemory(address + offset, tail.address + tail.pos, toCopy);
-
-      offset += toCopy;
-      tail.limit += toCopy;
-    }
-
-    size += byteCount;
+    byteString.write(this);
     return this;
   }
 
@@ -955,7 +948,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
         int runLimit = Math.min(endIndex, NativeSegment.SIZE - segmentOffset);
 
         // Emit a 7-bit character with 1 byte.
-        UNSAFE.putByte(address + segmentOffset + i, (byte) c); // 0xxxxxxx
+        NativeUtil.putByte(address, segmentOffset + i, (byte) c); // 0xxxxxxx
         i += 1;
 
         // Fast-path contiguous runs of ASCII characters. This is ugly, but yields a ~4x performance
@@ -963,7 +956,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
         while (i < runLimit) {
           c = string.charAt(i);
           if (c >= 0x80) break;
-          UNSAFE.putByte(address + segmentOffset + i, (byte) c); // 0xxxxxxx
+          NativeUtil.putByte(address, segmentOffset + i, (byte) c); // 0xxxxxxx
           i += 1;
         }
 
@@ -1082,7 +1075,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
       NativeSegment tail = writableNativeSegment(1);
 
       int toCopy = Math.min(limit - offset, NativeSegment.SIZE - tail.limit);
-      tail.copyFrom(0, toCopy, source, offset);
+      tail.copyFrom(source, offset, toCopy);
 
       offset += toCopy;
       tail.limit += toCopy;
@@ -1112,7 +1105,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
 
   @Override public NativeBuffer writeByte(int b) {
     NativeSegment tail = writableNativeSegment(1);
-    UNSAFE.putByte(tail.address + tail.limit, (byte) b);
+    NativeUtil.putByte(tail.address, tail.limit, (byte) b);
     tail.limit += 1;
     size += 1;
     return this;
@@ -1120,7 +1113,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
 
   @Override public NativeBuffer writeShort(int s) {
     NativeSegment tail = writableNativeSegment(2);
-    UNSAFE.putShort(tail.address + tail.limit, (short) s);
+    NativeUtil.putShort(tail.address, tail.limit, (short) s);
     tail.limit += 2;
     size += 2;
     return this;
@@ -1132,7 +1125,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
 
   @Override public NativeBuffer writeInt(int i) {
     NativeSegment tail = writableNativeSegment(4);
-    UNSAFE.putInt(tail.address + tail.limit, i);
+    NativeUtil.putInt(tail.address, tail.limit, i);
     tail.limit += 4;
     size += 4;
     return this;
@@ -1144,7 +1137,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
 
   @Override public NativeBuffer writeLong(long v) {
     NativeSegment tail = writableNativeSegment(8);
-    UNSAFE.putLong(tail.address + tail.limit, v);
+    NativeUtil.putLong(tail.address, tail.limit, v);
     tail.limit += 8;
     size += 8;
     return this;
@@ -1198,12 +1191,12 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
     int pos = tail.limit + width; // We write backwards from right to left.
     while (v != 0) {
       int digit = (int) (v % 10);
-      UNSAFE.putByte(address + pos, DIGITS[digit]);
+      NativeUtil.putByte(address, pos, DIGITS[digit]);
       pos -= 1;
       v /= 10;
     }
     if (negative) {
-      UNSAFE.putByte(address + pos, (byte) '-');
+      NativeUtil.putByte(address, pos, (byte) '-');
       pos -= 1;
     }
 
@@ -1223,7 +1216,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
     NativeSegment tail = writableNativeSegment(width);
     long address = tail.address;
     for (int pos = tail.limit + width - 1, start = tail.limit; pos >= start; pos--) {
-      UNSAFE.putByte(address + pos, DIGITS[(int) (v & 0xF)]);
+      NativeUtil.putByte(address, pos, DIGITS[(int) (v & 0xF)]);
       v >>>= 4;
     }
     tail.limit += width;
@@ -1399,7 +1392,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
       }
     }
 
-    // todo(bnorm) - native
+    // TODO(bnorm): native
 //    // Scan through the segments, searching for b.
 //    while (offset < toIndex) {
 //      byte[] data = s.data;
@@ -1456,7 +1449,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
       }
     }
 
-    // todo - native
+    // TODO(bnorm): native
 //    // Scan through the segments, searching for the lead byte. Each time that is found, delegate to
 //    // rangeEquals() to check for a complete match.
 //    byte b0 = bytes.getByte(0);
@@ -1516,7 +1509,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
       }
     }
 
-    // todo(bnorm) - native
+    // TODO(bnorm): native
 //    // Special case searching for one of two bytes. This is a common case for tools like Moshi,
 //    // which search for pairs of chars like `\r` and `\n` or {@code `"` and `\`. The impact of this
 //    // optimization is a ~5x speedup for this case without a substantial cost to other cases.
@@ -1655,7 +1648,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
    * Returns the 128-bit MD5 hash of this buffer.
    */
   public NativeByteString md5() {
-    // todo(bnorm) - native
+    // TODO(bnorm): native
     throw new UnsupportedOperationException();
   }
 
@@ -1663,7 +1656,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
    * Returns the 160-bit SHA-1 hash of this buffer.
    */
   public NativeByteString sha1() {
-    // todo(bnorm) - native
+    // TODO(bnorm): native
     throw new UnsupportedOperationException();
   }
 
@@ -1671,7 +1664,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
    * Returns the 256-bit SHA-256 hash of this buffer.
    */
   public NativeByteString sha256() {
-    // todo(bnorm) - native
+    // TODO(bnorm): native
     throw new UnsupportedOperationException();
   }
 
@@ -1679,7 +1672,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
    * Returns the 512-bit SHA-512 hash of this buffer.
    */
   public NativeByteString sha512() {
-    // todo(bnorm) - native
+    // TODO(bnorm): native
     throw new UnsupportedOperationException();
   }
 
@@ -1687,7 +1680,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
    * Returns the 160-bit SHA-1 HMAC of this buffer.
    */
   public NativeByteString hmacSha1(NativeByteString key) {
-    // todo(bnorm) - native
+    // TODO(bnorm): native
     throw new UnsupportedOperationException();
   }
 
@@ -1695,7 +1688,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
    * Returns the 256-bit SHA-256 HMAC of this buffer.
    */
   public NativeByteString hmacSha256(NativeByteString key) {
-    // todo(bnorm) - native
+    // TODO(bnorm): native
     throw new UnsupportedOperationException();
   }
 
@@ -1703,7 +1696,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
    * Returns the 512-bit SHA-512 HMAC of this buffer.
    */
   public NativeByteString hmacSha512(NativeByteString key) {
-    // todo(bnorm) - native
+    // TODO(bnorm): native
     throw new UnsupportedOperationException();
   }
 
@@ -1766,10 +1759,10 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
     NativeBuffer result = new NativeBuffer();
     if (size == 0 || head == null) return result;
 
-    result.head = new NativeSegment(head);
+    result.head = head.sharedCopy();
     result.head.next = result.head.prev = result.head;
     for (NativeSegment s = head.next; s != head; s = s.next) {
-      result.head.prev.push(new NativeSegment(s));
+      result.head.prev.push(s.sharedCopy());
     }
     result.size = size;
     return result;
@@ -1789,6 +1782,7 @@ public final class NativeBuffer implements BufferedNativeSource, BufferedNativeS
    * Returns an immutable copy of the first {@code byteCount} bytes of this buffer as a byte string.
    */
   public NativeByteString snapshot(int byteCount) {
+    // TODO(bnorm): native
     throw new UnsupportedOperationException();
 //    if (byteCount == 0) return NativeByteString.EMPTY;
 //    return new NativeSegmentedByteString(this, byteCount);

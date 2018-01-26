@@ -1,16 +1,23 @@
 package okio;
 
-import sun.nio.ch.DirectBuffer;
+import static okio.NativeUtil.allocate;
+import static okio.NativeUtil.copyFromArray;
+import static okio.NativeUtil.hash0;
+import static okio.Util.arrayRangeEquals;
+import static okio.Util.checkOffsetAndCount;
 
-import javax.annotation.Nullable;
-import java.io.*;
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.io.OutputStream;
+import java.io.Serializable;
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
-
-import static okio.NativeUtil.*;
-import static okio.Util.arrayRangeEquals;
-import static okio.Util.checkOffsetAndCount;
+import javax.annotation.Nullable;
+import sun.nio.ch.DirectBuffer;
 
 /**
  * An immutable sequence of bytes.
@@ -29,9 +36,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
   static final char[] HEX_DIGITS =
           {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
 
-  /**
-   * A singleton empty {@code ByteString}.
-   */
+  /** A singleton empty {@code ByteString}. */
   public static final NativeByteString EMPTY = NativeByteString.of();
 
   final long address;
@@ -40,9 +45,11 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
   transient String utf8; // Lazily computed.
 
   NativeByteString(long address, int size) {
-    // todo(bnorm) - need to free the address when finalized
     this.address = address; // Trusted internal constructor doesn't clone data.
     this.size = size;
+
+    // Use this ByteString as a way to free the address memory
+    if (address != -1) Disposer.addRecord(this, new AddressDisposer(address));
   }
 
   /**
@@ -51,8 +58,8 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
   public static NativeByteString of(byte... data) {
     if (data == null) throw new IllegalArgumentException("data == null");
 
-    long address = UNSAFE.allocateMemory(data.length);
-    copyFromArray(data, 0, address, data.length);
+    long address = allocate(data.length);
+    copyFromArray(data, 0, address, 0, data.length);
     return new NativeByteString(address, data.length);
   }
 
@@ -64,26 +71,29 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
     if (data == null) throw new IllegalArgumentException("data == null");
     checkOffsetAndCount(data.length, offset, byteCount);
 
-    long address = UNSAFE.allocateMemory(data.length);
-    copyFromArray(data, offset, address, byteCount);
+    long address = allocate(data.length);
+    copyFromArray(data, offset, address, 0, byteCount);
     return new NativeByteString(address, data.length);
   }
 
   public static NativeByteString of(ByteBuffer data) {
+    // TODO(bnorm): doc that buffer needs to be flipped first
     if (data == null) throw new IllegalArgumentException("data == null");
 
     int byteCount = data.remaining();
-    long address = UNSAFE.allocateMemory(byteCount);
+    long address = allocate(byteCount);
     if (data instanceof DirectBuffer) {
-      UNSAFE.copyMemory(((DirectBuffer) data).address(), address, byteCount);
+      long source = ((DirectBuffer) data).address();
+      NativeUtil.copy(source, address, byteCount);
     } else if (data.hasArray()) {
-      copyFromArray(data.array(), data.position(), address, byteCount);
+      copyFromArray(data.array(), data.position(), address, 0, byteCount);
     } else {
-      // todo(bnorm) is there a way to void this Heap -> Heap -> Off-Heap copy?
+      // Read-only
+      // TODO(bnorm): is there a way to void this Heap -> Heap -> Off-Heap copy?
       // Would a Heap -> Off-Heap -> Off-Heap copy be better? (ie, DirectByteBuffer)
       byte[] copy = new byte[byteCount];
       data.get(copy);
-      copyFromArray(copy, 0, address, byteCount);
+      copyFromArray(copy, 0, address, 0, byteCount);
     }
 
     return new NativeByteString(address, byteCount);
@@ -94,7 +104,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
    */
   public static NativeByteString encodeUtf8(String s) {
     if (s == null) throw new IllegalArgumentException("s == null");
-    // todo(bnorm) is there a way to void this Heap -> Heap -> Off-Heap copy?
+    // TODO(bnorm): is there a way to avoid this Heap -> Heap -> Off-Heap copy?
     NativeByteString byteString = of(s.getBytes(Util.UTF_8));
     byteString.utf8 = s;
     return byteString;
@@ -106,7 +116,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
   public static NativeByteString encodeString(String s, Charset charset) {
     if (s == null) throw new IllegalArgumentException("s == null");
     if (charset == null) throw new IllegalArgumentException("charset == null");
-    // todo(bnorm) is there a way to void this Heap -> Heap -> Off-Heap copy?
+    // TODO(bnorm): is there a way to avoid this Heap -> Heap -> Off-Heap copy?
     return of(s.getBytes(charset));
   }
 
@@ -116,15 +126,14 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
   public String utf8() {
     String result = utf8;
     // We don't care if we double-allocate in racy code.
-    return result != null ? result : (utf8 = new String(data, Util.UTF_8));
+    return result != null ? result : (utf8 = new String(toByteArray(), Util.UTF_8));
   }
 
   /**
    * Constructs a new {@code String} by decoding the bytes using {@code charset}.
    */
   public String string(Charset charset) {
-    if (charset == null) throw new IllegalArgumentException("charset == null");
-    return new String(data, charset);
+    return toByteString().string(charset);
   }
 
   /**
@@ -133,73 +142,31 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
    * RFC, the returned string does not wrap lines at 76 columns.
    */
   public String base64() {
-    // todo(bnorm) - native
-    throw new UnsupportedOperationException();
+    return toByteString().base64();
   }
 
-  /**
-   * Returns the 128-bit MD5 hash of this byte string.
-   */
-  public NativeByteString md5() {
-    // todo(bnorm) - native
-    throw new UnsupportedOperationException();
+  public ByteString md5() {
+    return toByteString().md5();
   }
 
-  /**
-   * Returns the 160-bit SHA-1 hash of this byte string.
-   */
-  public NativeByteString sha1() {
-    // todo(bnorm) - native
-    throw new UnsupportedOperationException();
+  public ByteString sha1() {
+    return toByteString().sha1();
   }
 
-  /**
-   * Returns the 256-bit SHA-256 hash of this byte string.
-   */
-  public NativeByteString sha256() {
-    // todo(bnorm) - native
-    throw new UnsupportedOperationException();
+  public ByteString sha256() {
+    return toByteString().sha256();
   }
 
-  /**
-   * Returns the 512-bit SHA-512 hash of this byte string.
-   */
-  public NativeByteString sha512() {
-    // todo(bnorm) - native
-    throw new UnsupportedOperationException();
+  public ByteString hmacSha1(ByteString key) {
+    return toByteString().hmacSha1(key);
   }
 
-  /**
-   * Returns the 160-bit SHA-1 HMAC of this byte string.
-   */
-  public NativeByteString hmacSha1(NativeByteString key) {
-    // todo(bnorm) - native
-    throw new UnsupportedOperationException();
+  public ByteString hmacSha256(ByteString key) {
+    return toByteString().hmacSha256(key);
   }
 
-  /**
-   * Returns the 256-bit SHA-256 HMAC of this byte string.
-   */
-  public NativeByteString hmacSha256(NativeByteString key) {
-    // todo(bnorm) - native
-    throw new UnsupportedOperationException();
-  }
-
-  /**
-   * Returns the 512-bit SHA-512 HMAC of this byte string.
-   */
-  public NativeByteString hmacSha512(NativeByteString key) {
-    // todo(bnorm) - native
-    throw new UnsupportedOperationException();
-  }
-
-  /**
-   * Returns this byte string encoded as <a href="http://www.ietf.org/rfc/rfc4648.txt">URL-safe
-   * Base64</a>.
-   */
   public String base64Url() {
-    // todo(bnorm) - native
-    throw new UnsupportedOperationException();
+    return toByteString().base64Url();
   }
 
   /**
@@ -207,7 +174,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
    * Returns null if {@code base64} is not a Base64-encoded sequence of bytes.
    */
   public static @Nullable NativeByteString decodeBase64(String base64) {
-    // todo(bnorm) - native
+    // TODO(bnorm): native
     throw new UnsupportedOperationException();
   }
 
@@ -217,7 +184,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
   public String hex() {
     char[] result = new char[size * 2];
     int c = 0;
-    for (byte b : data) {
+    for (byte b : toByteArray()) {
       result[c++] = HEX_DIGITS[(b >> 4) & 0xf];
       result[c++] = HEX_DIGITS[b & 0xf];
     }
@@ -262,57 +229,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
       read = in.read(result, offset, byteCount - offset);
       if (read == -1) throw new EOFException();
     }
-    return new NativeByteString(result, byteCount);
-  }
-
-  /**
-   * Returns a byte string equal to this byte string, but with the bytes 'A'
-   * through 'Z' replaced with the corresponding byte in 'a' through 'z'.
-   * Returns this byte string if it contains no bytes in 'A' through 'Z'.
-   */
-  public NativeByteString toAsciiLowercase() {
-    // Search for an uppercase character. If we don't find one, return this.
-    for (int i = 0; i < size; i++) {
-      byte c = data[i];
-      if (c < 'A' || c > 'Z') continue;
-
-      // If we reach this point, this string is not not lowercase. Create and
-      // return a new byte string.
-      byte[] lowercase = data.clone();
-      lowercase[i++] = (byte) (c - ('A' - 'a'));
-      for (; i < lowercase.length; i++) {
-        c = lowercase[i];
-        if (c < 'A' || c > 'Z') continue;
-        lowercase[i] = (byte) (c - ('A' - 'a'));
-      }
-      return new NativeByteString(lowercase, size);
-    }
-    return this;
-  }
-
-  /**
-   * Returns a byte string equal to this byte string, but with the bytes 'a'
-   * through 'z' replaced with the corresponding byte in 'A' through 'Z'.
-   * Returns this byte string if it contains no bytes in 'a' through 'z'.
-   */
-  public NativeByteString toAsciiUppercase() {
-    // Search for an lowercase character. If we don't find one, return this.
-    for (int i = 0; i < size; i++) {
-      byte c = data[i];
-      if (c < 'a' || c > 'z') continue;
-
-      // If we reach this point, this string is not not uppercase. Create and
-      // return a new byte string.
-      byte[] lowercase = data.clone();
-      lowercase[i++] = (byte) (c - ('a' - 'A'));
-      for (; i < lowercase.length; i++) {
-        c = lowercase[i];
-        if (c < 'a' || c > 'z') continue;
-        lowercase[i] = (byte) (c - ('a' - 'A'));
-      }
-      return new NativeByteString(lowercase, size);
-    }
-    return this;
+    return of(result, 0, byteCount);
   }
 
   /**
@@ -341,16 +258,16 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
       return this;
     }
 
-    byte[] copy = new byte[subLen];
-    System.arraycopy(data, beginIndex, copy, 0, subLen);
-    return new NativeByteString(copy);
+    long copy = NativeUtil.allocate(subLen);
+    NativeUtil.copy(address + beginIndex, copy, subLen);
+    return new NativeByteString(copy, subLen);
   }
 
   /**
    * Returns the byte at {@code pos}.
    */
   public byte getByte(int pos) {
-    return data[pos];
+    return NativeUtil.getByte(address, pos);
   }
 
   /**
@@ -364,7 +281,9 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
    * Returns a byte array containing a copy of the bytes in this {@code ByteString}.
    */
   public byte[] toByteArray() {
-    return data.clone();
+    byte[] array = new byte[size];
+    NativeUtil.copyToArray(address, 0, array, 0, size);
+    return array;
   }
 
   long internalAddress() {
@@ -372,25 +291,30 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
   }
 
   /**
-   * Returns a {@code ByteBuffer} view of the bytes in this {@code ByteString}.
-   */
-  public ByteBuffer asByteBuffer() {
-    return ByteBuffer.wrap(data).asReadOnlyBuffer();
-  }
-
-  /**
    * Writes the contents of this byte string to {@code out}.
    */
   public void write(OutputStream out) throws IOException {
     if (out == null) throw new IllegalArgumentException("out == null");
-    out.write(data);
+    // TODO(bnorm): is there a way to avoid the Off-Heap -> Heap -> stream copy?
+    out.write(toByteArray());
   }
 
   /**
    * Writes the contents of this byte string to {@code buffer}.
    */
-  void write(Buffer buffer) {
-    buffer.write(data, 0, size);
+  void write(NativeBuffer buffer) {
+    long offset = 0;
+    while (offset < size) {
+      NativeSegment tail = buffer.writableNativeSegment(1);
+
+      long toCopy = Math.min(size - offset, NativeSegment.SIZE - tail.limit);
+      NativeUtil.copy(address + offset, tail.address + tail.pos, toCopy);
+
+      offset += toCopy;
+      tail.limit += toCopy;
+    }
+
+    buffer.size += size;
   }
 
   /**
@@ -399,7 +323,8 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
    * out of bounds.
    */
   public boolean rangeEquals(int offset, NativeByteString other, int otherOffset, int byteCount) {
-    return other.rangeEquals(otherOffset, this.data, offset, byteCount);
+    return  otherOffset <= size - byteCount
+        && other.rangeEquals(otherOffset, this.address, offset, byteCount);
   }
 
   /**
@@ -410,7 +335,13 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
   public boolean rangeEquals(int offset, byte[] other, int otherOffset, int byteCount) {
     return offset >= 0 && offset <= size - byteCount
             && otherOffset >= 0 && otherOffset <= other.length - byteCount
-            && arrayRangeEquals(data, offset, other, otherOffset, byteCount);
+            && NativeUtil.rangeEquals(address, offset, other, otherOffset, byteCount);
+  }
+
+  boolean rangeEquals(int offset, long other, int otherOffset, int byteCount) {
+    return offset >= 0 && offset <= size - byteCount
+        && otherOffset >= 0
+        && NativeUtil.equals0(this.address + offset, other + otherOffset, byteCount);
   }
 
   public final boolean startsWith(NativeByteString prefix) {
@@ -434,7 +365,8 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
   }
 
   public final int indexOf(NativeByteString other, int fromIndex) {
-    return indexOf(other.internalArray(), fromIndex);
+    // TODO(bnorm): native indexOf0
+    return -1;
   }
 
   public final int indexOf(byte[] other) {
@@ -442,12 +374,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
   }
 
   public int indexOf(byte[] other, int fromIndex) {
-    fromIndex = Math.max(fromIndex, 0);
-    for (int i = fromIndex, limit = size - other.length; i <= limit; i++) {
-      if (arrayRangeEquals(data, i, other, 0, other.length)) {
-        return i;
-      }
-    }
+    // TODO(bnorm): native indexOf0
     return -1;
   }
 
@@ -456,7 +383,8 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
   }
 
   public final int lastIndexOf(NativeByteString other, int fromIndex) {
-    return lastIndexOf(other.internalArray(), fromIndex);
+    // TODO(bnorm): native lastIndexOf0
+    return -1;
   }
 
   public final int lastIndexOf(byte[] other) {
@@ -464,13 +392,13 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
   }
 
   public int lastIndexOf(byte[] other, int fromIndex) {
-    fromIndex = Math.min(fromIndex, size - other.length);
-    for (int i = fromIndex; i >= 0; i--) {
-      if (arrayRangeEquals(data, i, other, 0, other.length)) {
-        return i;
-      }
-    }
+    // TODO(bnorm): native lastIndexOf0
     return -1;
+  }
+
+  /** Returns a copy as a non-segmented byte string. */
+  private ByteString toByteString() {
+    return new ByteString(toByteArray());
   }
 
   @Override public boolean equals(Object o) {
@@ -550,7 +478,7 @@ public class NativeByteString implements Serializable, Comparable<NativeByteStri
       Field address = NativeByteString.class.getDeclaredField("address");
       address.setAccessible(true);
       address.set(this, byteString.address);
-      // todo(bnorm) - make sure byteString doesn't free memory
+      // TODO(bnorm): make sure byteString doesn't free memory
     } catch (NoSuchFieldException e) {
       throw new AssertionError();
     } catch (IllegalAccessException e) {

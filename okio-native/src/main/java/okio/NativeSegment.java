@@ -2,9 +2,6 @@ package okio;
 
 import javax.annotation.Nullable;
 
-import static okio.NativeUtil.UNSAFE;
-import static okio.NativeUtil.arrayBaseOffset;
-
 /**
  * A segment of a buffer.
  *
@@ -30,6 +27,13 @@ final class NativeSegment {
 
   final long address;
 
+  /**
+   * When this lock is garbage collected, the address should be freed. Since segments can share
+   * addresses, we need an other object besides the segment to attach the freeing of address memory.
+   * This object should also be shared between objects that share address.
+   */
+  private final Object addressLock;
+
   /** The next byte of application data byte to read in this segment. */
   int pos;
 
@@ -49,28 +53,40 @@ final class NativeSegment {
   NativeSegment prev;
 
   NativeSegment() {
-    this.address = UNSAFE.allocateMemory(SIZE);
+    this.address = NativeUtil.allocate(SIZE);
+    this.addressLock = new Object();
     this.owner = true;
     this.shared = false;
+
+    Disposer.addRecord(addressLock, new AddressDisposer(address));
   }
 
-  NativeSegment(NativeSegment shareFrom) {
-    this(shareFrom.address, shareFrom.pos, shareFrom.limit);
-    shareFrom.shared = true;
-  }
-
-  NativeSegment(long address, int pos, int limit) {
+  NativeSegment(long address, Object addressLock, int pos, int limit, boolean shared, boolean owner) {
     this.address = address;
+    this.addressLock = addressLock;
     this.pos = pos;
     this.limit = limit;
-    this.owner = false;
-    this.shared = true;
+    this.shared = shared;
+    this.owner = owner;
   }
 
-  public void free() {
-    if (owner) {
-      UNSAFE.freeMemory(address);
-    }
+  /**
+   * Returns a new segment that shares the underlying byte array with this. Adjusting pos and limit
+   * are safe but writes are forbidden. This also marks the current segment as shared, which
+   * prevents it from being pooled.
+   */
+  NativeSegment sharedCopy() {
+    shared = true;
+    return new NativeSegment(address, addressLock, pos, limit, true, false);
+  }
+
+  /** Returns a new segment that its own private copy of the underlying byte array. */
+  NativeSegment unsharedCopy() {
+    NativeSegment segment = new NativeSegment();
+    segment.pos = pos;
+    segment.limit = limit;
+    NativeUtil.copy(address, segment.address, limit);
+    return segment;
   }
 
   /**
@@ -116,10 +132,10 @@ final class NativeSegment {
     //    may lead to long chains of short segments.
     // To balance these goals we only share segments when the copy will be large.
     if (byteCount >= SHARE_MINIMUM) {
-      prefix = new NativeSegment(this);
+      prefix = sharedCopy();
     } else {
       prefix = NativeSegmentPool.take();
-      UNSAFE.copyMemory(address + pos, prefix.address, byteCount);
+      NativeUtil.copy(address + pos, prefix.address, byteCount);
     }
 
     prefix.limit = prefix.pos + byteCount;
@@ -150,21 +166,21 @@ final class NativeSegment {
       // We can't fit byteCount bytes at the sink's current position. Shift sink first.
       if (sink.shared) throw new IllegalArgumentException();
       if (sink.limit + byteCount - sink.pos > SIZE) throw new IllegalArgumentException();
-      UNSAFE.copyMemory(sink.address + pos, sink.address, sink.limit - sink.pos);
+      NativeUtil.copy(sink.address + pos, sink.address, sink.limit - sink.pos);
       sink.limit -= sink.pos;
       sink.pos = 0;
     }
 
-    UNSAFE.copyMemory(address + pos, sink.address + sink.limit, byteCount);
+    NativeUtil.copy(address + pos, sink.address + sink.limit, byteCount);
     sink.limit += byteCount;
     pos += byteCount;
   }
 
   void copyTo(long offset, long length, byte[] dst, long dstPos) {
-    UNSAFE.copyMemory(null, address + pos + offset, dst, arrayBaseOffset + dstPos, length);
+    NativeUtil.copyToArray(address, pos + offset, dst, dstPos, length);
   }
 
-  void copyFrom(long offset, long length, byte[] src, long srcPos) {
-    UNSAFE.copyMemory(src, arrayBaseOffset + srcPos, null, address + limit + offset, length);
+  void copyFrom(byte[] src, long offset, long byteCount) {
+    NativeUtil.copyFromArray(src, offset, address, limit, byteCount);
   }
 }
